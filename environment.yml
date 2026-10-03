@@ -1,0 +1,34 @@
+name: Superres_Surface_Temperature_Reconstruction
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - scipy
+  - pandas>=2.0
+  - xarray
+  - dask
+  - zarr
+  - gdal
+  - rasterio
+  - rioxarray
+  - geopandas
+  - shapely
+  - pyproj
+  - pystac-client
+  - planetary-computer
+  - odc-stac
+  - earthaccess
+  - astropy
+  - pdal
+  - python-pdal
+  - laspy
+  - scikit-learn
+  - lightgbm
+  - matplotlib
+  - jupyterlab
+  - ipykernel
+  - tensorboard
+  - ruff
+  - pytest
