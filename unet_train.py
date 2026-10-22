@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 import warnings
 from pathlib import Path
 
@@ -10,12 +11,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import xarray as xr
 
-from lst_common import psf_blur
+from lst_common import keep_mask, psf_blur, ring_index, spectrum, valid_tiles
 
 warnings.filterwarnings("ignore", message="Consolidated metadata")
 
 PYRAMID = Path("data/landsat/krakow_wald_pyramid.zarr")
-BASELINE_PREDS = Path("results/baselines/preds")
+BASELINE_PREDS = {"lst_270": Path("results/baselines/preds"),
+                  "lst_270psf": Path("results/baselines_psf/preds")}
 OUT_DIR = Path("results/unet")
 FACTOR = 3
 PIXEL_M = 90.0
@@ -27,16 +29,18 @@ FEATURES = ["emis", "blue", "green", "red", "nir08", "swir16", "swir22",
             "ndvi", "ndbi", "mndwi", "albedo"]
 INDEX_FEATURES = ["ndvi", "ndbi", "mndwi", "albedo"]
 GUIDE_CHANNELS = [8, 9, 10, 11]
+TILE = 64
+COARSE_M = 270.0
 
 
 def upsample(a):
     return np.repeat(np.repeat(a, FACTOR, axis=0), FACTOR, axis=1)
 
 
-def load_scene(ds, i):
+def load_scene(ds, i, coarse_var):
     frame = ds.isel(time=i).load()
-    up_lst = upsample(frame["lst_270"].values)
-    channels = [up_lst - np.nanmean(frame["lst_270"].values)]
+    up_lst = upsample(frame[coarse_var].values)
+    channels = [up_lst - np.nanmean(frame[coarse_var].values)]
     channels += [frame[f"{f}_90"].values for f in FEATURES]
     channels += [frame[f"{f}_90"].values - upsample(frame[f"{f}_270"].values) for f in INDEX_FEATURES]
     return {
@@ -223,16 +227,54 @@ def train(model, train_scenes, val_scenes, args, project, device):
     return best_score
 
 
+def detail_power_ratio(pairs):
+    window = np.outer(np.hanning(TILE), np.hanning(TILE))
+    rings = ring_index(TILE)
+    n_rings = TILE // 2
+    freq = np.arange(n_rings) / (TILE * PIXEL_M) * 1000
+    band = freq > 1000 / (2 * COARSE_M)
+    power_pred, power_truth = 0.0, 0.0
+    for pred, truth in pairs:
+        for y, x in valid_tiles(np.stack([truth, pred]), TILE):
+            f_truth = spectrum(truth[y:y + TILE, x:x + TILE], window)
+            f_pred = spectrum(pred[y:y + TILE, x:x + TILE], window)
+            power_truth += np.bincount(rings, np.abs(f_truth) ** 2)[:n_rings][band].sum()
+            power_pred += np.bincount(rings, np.abs(f_pred) ** 2)[:n_rings][band].sum()
+    return power_pred / power_truth if power_truth > 0 else np.nan
+
+
+def validation_summary(model, val_scenes, args, project, device):
+    sigma_px = args.sigma_m / PIXEL_M
+    preds = [predict_scene(model, s, project, device) for s in val_scenes]
+    truths = [s["truth"] for s in val_scenes]
+    summary = {
+        "name": args.variant + args.tag,
+        "variant": args.variant,
+        "lambda_reg": args.lambda_reg,
+        "sigma_m": args.sigma_m,
+        "project": project,
+        "coarse": args.coarse,
+        "val_rmse": float(np.median([scene_score(p, t, sigma_px, False) for p, t in zip(preds, truths)])),
+        "val_rmse_psf": float(np.median([scene_score(p, t, sigma_px, True) for p, t in zip(preds, truths)])),
+        "val_detail_power": float(detail_power_ratio(list(zip(preds, truths)))),
+    }
+    with open(OUT_DIR / f"val_{summary['name']}.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Walidacja: RMSE {summary['val_rmse']:.3f} K, RMSE z PSF {summary['val_rmse_psf']:.3f} K, "
+          f"moc szczegółu / prawda {summary['val_detail_power']:.2f}")
+
+
 def evaluate_test(model, test_scenes, args, project, device):
     sigma_px = args.sigma_m / PIXEL_M
-    pred_dir = OUT_DIR / "preds" / args.variant
+    name = args.variant + args.tag
+    pred_dir = OUT_DIR / "preds" / name
     pred_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for s in test_scenes:
         pred = predict_scene(model, s, project, device)
         sensor = psf_blur(pred, sigma_px)
         mask = np.isfinite(s["truth"]) & np.isfinite(pred)
-        baseline_path = BASELINE_PREDS / f"{s['date']}.npz"
+        baseline_path = BASELINE_PREDS[args.coarse] / f"{s['date']}.npz"
         if baseline_path.exists():
             with np.load(baseline_path) as npz:
                 for key in npz.files:
@@ -242,9 +284,9 @@ def evaluate_test(model, test_scenes, args, project, device):
                      "rmse": scene_score(np.where(mask, pred, np.nan), truth, sigma_px, False),
                      "rmse_psf": scene_score(np.where(mask, pred, np.nan), truth, sigma_px, True)})
         np.savez_compressed(pred_dir / f"{s['date']}.npz", truth=s["truth"],
-                            **{f"unet_{args.variant}": pred, f"unet_{args.variant}_sensor": sensor})
+                            **{f"unet_{name}": pred, f"unet_{name}_sensor": sensor})
     df = pd.DataFrame(rows)
-    df.to_csv(OUT_DIR / f"test_{args.variant}.csv", index=False)
+    df.to_csv(OUT_DIR / f"test_{name}.csv", index=False)
     print(f"\nTest ({len(df)} scen): RMSE mediana {df['rmse'].median():.3f} K, "
           f"RMSE z PSF mediana {df['rmse_psf'].median():.3f} K")
 
@@ -259,8 +301,14 @@ def main():
     parser.add_argument("--lambda-reg", type=float, default=0.02)
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--project", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--tag", default="")
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--coarse", default="lst_270", choices=["lst_270", "lst_270psf"])
     args = parser.parse_args()
-    project = args.variant == "A" if args.project is None else args.project
+    if args.project is None:
+        project = args.variant == "A" and args.coarse == "lst_270"
+    else:
+        project = args.project
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(0)
@@ -268,27 +316,35 @@ def main():
 
     ds = xr.open_zarr(PYRAMID)
     years = pd.DatetimeIndex(ds.time.values).year.to_numpy()
-    usable = ds.frac_valid_270.values >= MIN_VALID
+    usable = (ds.frac_valid_270.values >= MIN_VALID) & keep_mask(ds.time.values, "Landsat")
     is_test = ds.is_test.values
     split = {
         "train": np.flatnonzero(usable & ~is_test & (years != VAL_YEAR)),
         "val": np.flatnonzero(usable & ~is_test & (years == VAL_YEAR)),
         "test": np.flatnonzero(usable & is_test),
     }
-    print(f"Wariant {args.variant}, projekcja: {project}, urządzenie: {device}")
+    print(f"Wariant {args.variant}{args.tag}, wejście: {args.coarse}, projekcja: {project}, "
+          f"lambda: {args.lambda_reg}, urządzenie: {device}")
     print({k: len(v) for k, v in split.items()})
 
-    scenes = {k: [load_scene(ds, i) for i in v] for k, v in split.items()}
+    scenes = {k: [load_scene(ds, i, args.coarse) for i in v] for k, v in split.items()}
     mean, std = channel_stats(scenes["train"])
     for part in scenes.values():
         prepare(part, mean, std)
 
     model = UNet(cin=scenes["train"][0]["input"].shape[0]).to(device)
     print(f"Parametry sieci: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} mln")
-    best = train(model, scenes["train"], scenes["val"], args, project, device)
-    print(f"Najlepsza walidacja: {best:.3f} K")
-    torch.save({"state_dict": model.state_dict(), "mean": mean, "std": std, "args": vars(args)},
-               OUT_DIR / f"unet_{args.variant}.pt")
+    ckpt_path = OUT_DIR / f"unet_{args.variant}{args.tag}.pt"
+    if args.eval_only:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["state_dict"])
+    else:
+        best = train(model, scenes["train"], scenes["val"], args, project, device)
+        print(f"Najlepsza walidacja: {best:.3f} K")
+        torch.save({"state_dict": model.state_dict(), "mean": mean, "std": std, "args": vars(args)},
+                   ckpt_path)
+    model.eval()
+    validation_summary(model, scenes["val"], args, project, device)
     evaluate_test(model, scenes["test"], args, project, device)
 
 

@@ -7,12 +7,14 @@ import pandas as pd
 import xarray as xr
 from scipy.ndimage import gaussian_filter
 
-from lst_common import block_mean
+from lst_common import block_mean, keep_mask
 
 warnings.filterwarnings("ignore", message="Consolidated metadata")
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 PYRAMID = Path("data/landsat/krakow_wald_pyramid.zarr")
-OUT_DIR = Path("results/baselines")
+COARSE_LST = "lst_270psf"
+OUT_DIR = Path("results/baselines_psf" if COARSE_LST == "lst_270psf" else "results/baselines")
 FACTOR = 3
 MIN_VALID = 0.3
 MIN_EVAL = 2000
@@ -36,6 +38,7 @@ def load_scene(ds, i):
     frame = ds.isel(time=i).load()
     names = FEATURES + ["lst"]
     coarse = {n: frame[f"{n}_270"].values for n in names}
+    coarse["lst"] = frame[COARSE_LST].values
     fine = {n: frame[f"{n}_90"].values for n in names}
     return coarse, fine
 
@@ -133,7 +136,8 @@ def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "preds").mkdir(exist_ok=True)
     ds = xr.open_zarr(PYRAMID)
-    usable = ds.frac_valid_270.values >= MIN_VALID
+    usable = (ds.frac_valid_270.values >= MIN_VALID) & keep_mask(ds.time.values, "Landsat")
+    print(f"Wejście zgrubne: {COARSE_LST}, wyniki: {OUT_DIR}")
     is_test = ds.is_test.values
     train_idx = np.flatnonzero(usable & ~is_test)
     test_idx = np.flatnonzero(usable & is_test)

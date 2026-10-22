@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from affine import Affine
@@ -8,6 +10,8 @@ CRS = "EPSG:32634"
 LS_BAD_BITS = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
 ECO_TRAIN_BUFFER = {"noc": 5, "dzień": 10}
 ECO_EVAL_BUFFER = {"noc": 13, "dzień": 25}
+QC_OUTLIERS = Path("results/qc_scene_outliers.csv")
+BAD_PERIODS = {"ECOSTRESS": [("2024-06-25", "2024-07-04")]}
 
 
 def decode(da):
@@ -159,3 +163,35 @@ def psf_blur(img, sigma_px, min_weight=0.99):
     with np.errstate(invalid="ignore", divide="ignore"):
         out = blurred / weight
     return np.where(weight >= min_weight, out, np.nan)
+
+
+def valid_tiles(stack, tile):
+    ok = np.isfinite(stack).all(axis=0)
+    h, w = ok.shape
+    return [(y, x) for y in range(0, h - tile + 1, tile) for x in range(0, w - tile + 1, tile)
+            if ok[y:y + tile, x:x + tile].all()]
+
+
+def ring_index(n):
+    fy, fx = np.indices((n, n)) - n // 2
+    return np.hypot(fx, fy).round().astype(int).ravel()
+
+
+def spectrum(img, window):
+    return np.fft.fftshift(np.fft.fft2((img - img.mean()) * window)).ravel()
+
+
+def excluded_times(sensor):
+    if not QC_OUTLIERS.exists():
+        return []
+    d = pd.read_csv(QC_OUTLIERS)
+    times = pd.to_datetime(d.loc[d["sensor"] == sensor, "time"], format="ISO8601")
+    return list(times.dt.floor("s"))
+
+
+def keep_mask(times, sensor):
+    t = pd.DatetimeIndex(times).floor("s")
+    keep = ~t.isin(excluded_times(sensor))
+    for start, end in BAD_PERIODS.get(sensor, []):
+        keep &= ~((t >= pd.Timestamp(start)) & (t < pd.Timestamp(end)))
+    return keep
